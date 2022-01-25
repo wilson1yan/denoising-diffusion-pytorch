@@ -4,6 +4,7 @@ import torch
 from torch import nn, optim
 from torch.utils import data
 from torchvision import transforms
+from torchvision.utils import make_grid
 from tensorfn import load_arg_config, load_wandb
 from tensorfn import distributed as dist
 from tensorfn.optim import lr_scheduler
@@ -11,7 +12,7 @@ from tqdm import tqdm
 
 from model import UNet
 from diffusion import GaussianDiffusion, make_beta_schedule
-from dataset import MultiResolutionDataset
+from dataset import MultiResolutionDataset, get_dataset
 from config import DiffusionConfig
 
 
@@ -36,6 +37,19 @@ def accumulate(model1, model2, decay=0.9999):
 
     for k in par1.keys():
         par1[k].data.mul_(decay).add_(par2[k].data, alpha=1 - decay)
+
+
+@torch.no_grad()
+def p_sample_loop(self, model, noise, device, noise_fn=torch.randn):
+    img = noise
+    for i in tqdm(reversed(range(self.num_timesteps)), total=self.num_timesteps):
+        img = self.p_sample(
+            model,
+            img,
+            torch.full((img.shape[0],), i, dtype=torch.int64).to(device),
+            noise_fn=noise_fn,
+        )
+    return img
 
 
 def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wandb):
@@ -92,6 +106,17 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
                     },
                     f"checkpoint/diffusion_{str(i).zfill(6)}.pt",
                 )
+            
+        if i % conf.evaluate.viz_every == 0 and wandb is not None:
+            img_shape = (3, conf.dataset.resolution, conf.dataset.resolution)
+            noise = torch.randn(64 // dist.get_world_size(), 
+                                *img_shape, dtype=torch.float32).to(device)
+            samples = p_sample_loop(diffusion, ema, noise, device) 
+            samples = torch.cat(dist.all_gather(samples), dim=0)
+            samples = torch.clamp(samples, -1, 1) * 0.5 + 0.5
+            samples = make_grid(samples, nrow=8)
+            if dist.is_primary():
+                wandb.log({"samples": wandb.Image(samples)}, step=i)
 
 
 def main(conf):
@@ -113,9 +138,7 @@ def main(conf):
         ]
     )
 
-    train_set = MultiResolutionDataset(
-        conf.dataset.path, transform, conf.dataset.resolution
-    )
+    train_set = get_dataset(conf, transform)
     train_sampler = dist.data_sampler(
         train_set, shuffle=True, distributed=conf.distributed
     )
