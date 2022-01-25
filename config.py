@@ -35,6 +35,7 @@ class Eval(Config):
     save_every: StrictInt
     valid_every: StrictInt
     log_every: StrictInt
+    viz_every: StrictInt
 
 
 class DiffusionConfig(MainConfig):

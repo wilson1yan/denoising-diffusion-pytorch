@@ -42,13 +42,19 @@ def accumulate(model1, model2, decay=0.9999):
 @torch.no_grad()
 def p_sample_loop(self, model, noise, device, noise_fn=torch.randn):
     img = noise
-    for i in tqdm(reversed(range(self.num_timesteps)), total=self.num_timesteps):
+    if dist.is_primary():
+        pbar = tqdm(total=self.num_timesteps)
+    for i in reversed(range(self.num_timesteps)):
         img = self.p_sample(
             model,
             img,
             torch.full((img.shape[0],), i, dtype=torch.int64).to(device),
             noise_fn=noise_fn,
         )
+        if dist.is_primary():
+            pbar.update(1)
+    if dist.is_primary():
+        pbar.close()
     return img
 
 
@@ -107,16 +113,20 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
                     f"checkpoint/diffusion_{str(i).zfill(6)}.pt",
                 )
             
-        if i % conf.evaluate.viz_every == 0 and wandb is not None:
+        if i % conf.evaluate.viz_every == 0:
             img_shape = (3, conf.dataset.resolution, conf.dataset.resolution)
             noise = torch.randn(64 // dist.get_world_size(), 
                                 *img_shape, dtype=torch.float32).to(device)
-            samples = p_sample_loop(diffusion, ema, noise, device) 
+            samples = p_sample_loop(diffusion, ema, noise, device).cpu()
             samples = torch.cat(dist.all_gather(samples), dim=0)
             samples = torch.clamp(samples, -1, 1) * 0.5 + 0.5
             samples = make_grid(samples, nrow=8)
             if dist.is_primary():
                 wandb.log({"samples": wandb.Image(samples)}, step=i)
+
+
+def compute_total_params(model):
+    return sum([np.prod(p.shape) for p in model.parameters() if p.requires_grad])
 
 
 def main(conf):
@@ -148,6 +158,9 @@ def main(conf):
     model = model.to(device)
     ema = conf.model.make()
     ema = ema.to(device)
+
+    if dist.is_primary():
+        print('total_params:', compute_total_params(model))
 
     if conf.distributed:
         model = nn.parallel.DistributedDataParallel(
